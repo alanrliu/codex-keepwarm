@@ -1,16 +1,16 @@
 # Install
 
-You need a logged-in [Claude Code](https://claude.com/claude-code) CLI. keepwarm
-reads no credentials of its own — it uses whatever authentication the CLI
-already has.
+You need a logged-in [Codex CLI](https://developers.openai.com/codex/cli).
+keepwarm reads no credentials of its own — it uses whatever authentication the
+CLI already has.
 
 ## macOS / Linux
 
 Requires bash 3.2+ (the version macOS ships) and `cron`.
 
 ```sh
-git clone https://github.com/mamuncseru/claude-keepwarm.git
-cd claude-keepwarm
+git clone https://github.com/alanrliu/codex-keepwarm.git
+cd codex-keepwarm
 
 ./keepwarm install     # hourly cron job
 ./keepwarm ping        # open the first window — sets your boundary phase
@@ -29,8 +29,8 @@ Uses Task Scheduler instead of cron, with the same commands, the same
 `config.env`, and the same state file format.
 
 ```powershell
-git clone https://github.com/mamuncseru/claude-keepwarm.git
-cd claude-keepwarm
+git clone https://github.com/alanrliu/codex-keepwarm.git
+cd codex-keepwarm
 
 .\keepwarm.ps1 install    # hourly scheduled task
 .\keepwarm.ps1 ping       # open the first window
@@ -56,24 +56,27 @@ hour.
 
 ## Finding the CLI
 
-keepwarm looks for `claude` in this order:
+keepwarm looks for `codex` in this order:
 
 1. `PATH`
 2. The copy bundled inside the VS Code / Cursor extension
-   (`…/anthropic.claude-code-*/resources/native-binary/`), newest match first
-3. `~/.local/bin`, `~/.claude/local`, `~/.bun/bin`
-4. `/usr/local/bin`, `/opt/homebrew/bin` (Unix) or `%APPDATA%\npm` (Windows)
+   (`…/openai.chatgpt-*/binaries/`), newest match first
+3. The standalone installer's versioned directory,
+   `~/.codex/packages/standalone/releases/*/bin/`, newest match first
+4. `~/.local/bin`, `~/.bun/bin`, `~/.npm-global/bin`
+5. `/usr/local/bin`, `/opt/homebrew/bin` (Unix) or `%APPDATA%\npm` (Windows)
 
-The extension bundle matters more than it sounds: it's a common install shape
-and it is **not** on `PATH`. Because the directory name carries the extension
-version, keepwarm globs and takes the newest — so an extension update doesn't
-quietly break your scheduled job.
+Steps 2 and 3 matter more than they sound: both are common install shapes, and
+the standalone one keeps its real binary in a version-numbered directory with
+only a symlink on `PATH`. Because those directory names carry a version,
+keepwarm globs and takes the newest — so an update doesn't quietly break your
+scheduled job.
 
 If auto-detection picks the wrong one, pin it:
 
 ```sh
 cp config.env.example config.env
-# then set CLAUDE_BIN=/full/path/to/claude
+# then set CODEX_BIN=/full/path/to/codex
 ```
 
 ## Verifying
@@ -102,9 +105,9 @@ history in Task Scheduler.
 
     Deleting the directory does **not** remove the schedule - the cron entry or
     scheduled task survives and fires hourly forever, failing silently. If you
-    already deleted it: `crontab -l | grep -v claude-keepwarm | crontab -` on
+    already deleted it: `crontab -l | grep -v codex-keepwarm | crontab -` on
     macOS/Linux, or
-    `Unregister-ScheduledTask -TaskName claude-keepwarm -Confirm:$false` on
+    `Unregister-ScheduledTask -TaskName codex-keepwarm -Confirm:$false` on
     Windows.
 
 See [Reference](reference.md#stopping-and-uninstalling) for the full details.

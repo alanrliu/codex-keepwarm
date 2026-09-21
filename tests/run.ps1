@@ -2,8 +2,11 @@
     keepwarm Windows test suite. No network, no API calls, no scheduled tasks.
 
     Mirrors tests/run.sh. Each test runs in a throwaway sandbox with a stub
-    `claude.cmd` (canned responses, counts invocations) pointed at via
-    KEEPWARM_CLAUDE_BIN, so results don't depend on the developer's machine.
+    `codex.cmd` (canned responses, counts invocations) pointed at via
+    KEEPWARM_CODEX_BIN, so results don't depend on the developer's machine.
+
+    The stub speaks the same JSONL event stream `codex exec --json` does: a
+    turn succeeded if and only if it ended with a turn.completed event.
 
     Task Scheduler registration is deliberately NOT unit-tested here - it has
     no safe stub. CI covers it with a real install/uninstall smoke test.
@@ -44,51 +47,72 @@ function New-Sandbox {
     # A stub for whichever platform we are on, so the suite runs on Windows,
     # macOS and Linux alike.
     if ($OnWindows) {
-        $stub = Join-Path $script:Sandbox 'claude.cmd'
+        $stub = Join-Path $script:Sandbox 'codex.cmd'
         $body = @'
 @echo off
 >>"%STUB_LOG%" echo call
+echo Reading additional input from stdin...
+echo {"type":"thread.started","thread_id":"stub-thread"}
 if "%STUB_MODE%"=="limited" (
-  echo Claude usage limit reached. Your limit will reset at 3pm.
-  exit /b 0
+  echo You've hit your usage limit. Try again later.
+  echo {"type":"turn.failed","error":{"message":"You've hit your usage limit."}}
+  exit /b 1
 )
 if "%STUB_MODE%"=="error" (
-  echo {"is_error":true,"result":"stub failure"}
+  echo {"type":"turn.failed","error":{"message":"stub failure"}}
   exit /b 1
 )
 if "%STUB_MODE%"=="auth" (
-  echo {"is_error":true,"duration_api_ms":0,"stop_reason":"stop_sequence","total_cost_usd":0,"terminal_reason":"api_error","result":"Failed to authenticate: OAuth session expired and could not be refreshed","type":"result"}
+  echo {"type":"error","message":"Reconnecting... 1/5 (unexpected status 401 Unauthorized: Missing bearer or basic authentication in header)"}
+  echo {"type":"turn.failed","error":{"message":"401 Unauthorized: Missing bearer or basic authentication in header"}}
   exit /b 1
+)
+if "%STUB_MODE%"=="hang" (
+  ping -n 60 127.0.0.1 >NUL
+  exit /b 0
 )
 if "%STUB_MODE%"=="flaky" (
   if not exist "%STUB_FLAG%" (
     >"%STUB_FLAG%" echo x
-    echo {"is_error":true,"result":"transient"}
+    echo {"type":"turn.failed","error":{"message":"transient"}}
     exit /b 1
   )
-  echo {"is_error":false,"result":"ok"}
+  echo {"type":"turn.completed","usage":{"input_tokens":13629,"output_tokens":5}}
   exit /b 0
 )
-echo {"is_error":false,"result":"ok","usage":{"input_tokens":167,"output_tokens":71}}
+echo {"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Pong."}}
+echo {"type":"turn.completed","usage":{"input_tokens":13629,"output_tokens":5}}
 exit /b 0
 '@
         [IO.File]::WriteAllText($stub, $body)
     } else {
-        $stub = Join-Path $script:Sandbox 'claude.sh'
+        $stub = Join-Path $script:Sandbox 'codex.sh'
         $body = @'
 #!/usr/bin/env bash
 printf 'call\n' >>"$STUB_LOG"
+printf 'Reading additional input from stdin...\n'
+printf '%s\n' '{"type":"thread.started","thread_id":"stub-thread"}'
 case "${STUB_MODE:-ok}" in
-  limited) printf 'Claude usage limit reached. Your limit will reset at 3pm.\n'; exit 0 ;;
-  error)   printf '{"is_error":true,"result":"stub failure"}\n'; exit 1 ;;
-  auth)    printf '%s\n' '{"is_error":true,"duration_api_ms":0,"stop_reason":"stop_sequence","total_cost_usd":0,"terminal_reason":"api_error","result":"Failed to authenticate: OAuth session expired and could not be refreshed","type":"result"}'; exit 1 ;;
+  limited)
+    printf "You've hit your usage limit. Try again later.\n"
+    printf '%s\n' '{"type":"turn.failed","error":{"message":"usage limit"}}'; exit 1 ;;
+  error)
+    printf '%s\n' '{"type":"turn.failed","error":{"message":"stub failure"}}'; exit 1 ;;
+  auth)
+    printf '%s\n' '{"type":"error","message":"Reconnecting... 1/5 (unexpected status 401 Unauthorized: Missing bearer or basic authentication in header)"}'
+    printf '%s\n' '{"type":"turn.failed","error":{"message":"401 Unauthorized: Missing bearer or basic authentication in header"}}'
+    exit 1 ;;
+  hang)
+    sleep 60 ;;
   flaky)
     if [ ! -f "$STUB_FLAG" ]; then
       printf 'x' >"$STUB_FLAG"
-      printf '{"is_error":true,"result":"transient"}\n'; exit 1
+      printf '%s\n' '{"type":"turn.failed","error":{"message":"transient"}}'; exit 1
     fi
-    printf '{"is_error":false,"result":"ok"}\n'; exit 0 ;;
-  *) printf '{"is_error":false,"result":"ok","usage":{"input_tokens":167}}\n'; exit 0 ;;
+    printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":13629,"output_tokens":5}}'; exit 0 ;;
+  *)
+    printf '%s\n' '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Pong."}}'
+    printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":13629,"output_tokens":5}}'; exit 0 ;;
 esac
 '@
         # LF only: CRLF would break the shebang.
@@ -101,14 +125,16 @@ esac
     $env:STUB_MODE                   = 'ok'
     $env:KEEPWARM_HOME               = Join-Path $script:Sandbox 'home'
     $env:KEEPWARM_ACTIVITY_DIR       = Join-Path $script:Sandbox 'activity'
-    $env:KEEPWARM_CLAUDE_BIN         = $stub
+    $env:KEEPWARM_CODEX_BIN          = $stub
     $env:KEEPWARM_PING_ATTEMPTS      = '2'
     $env:KEEPWARM_PING_RETRY_DELAY   = '0'
+    $env:KEEPWARM_PING_TIMEOUT       = '20'
 }
 
 function Remove-Sandbox {
     foreach ($v in 'STUB_LOG','STUB_FLAG','STUB_MODE','KEEPWARM_HOME','KEEPWARM_ACTIVITY_DIR',
-                   'KEEPWARM_CLAUDE_BIN','KEEPWARM_PING_ATTEMPTS','KEEPWARM_PING_RETRY_DELAY') {
+                   'KEEPWARM_CODEX_BIN','KEEPWARM_PING_ATTEMPTS','KEEPWARM_PING_RETRY_DELAY',
+                   'KEEPWARM_PING_TIMEOUT') {
         Remove-Item -Path "Env:$v" -ErrorAction SilentlyContinue
     }
     if ($script:Sandbox -and (Test-Path -LiteralPath $script:Sandbox)) {
@@ -201,7 +227,7 @@ Invoke-Test 'ping_opens_window_on_the_hour' {
     Invoke-Kw @('ping') | Out-Null
     $start = [long](Get-StateValue 'WINDOW_START')
     $end   = [long](Get-StateValue 'WINDOW_END')
-    Assert-Equal 1 (Get-Calls) 'claude called exactly once'
+    Assert-Equal 1 (Get-Calls) 'codex called exactly once'
     Assert-Equal 'ok' (Get-StateValue 'LAST_STATUS') 'status recorded'
     $d = [DateTimeOffset]::FromUnixTimeSeconds($start).ToLocalTime().DateTime
     Assert-Equal '00:00' $d.ToString('mm:ss') 'window start floored to the top of the hour'
@@ -260,7 +286,7 @@ Invoke-Test 'auth_failure_is_not_retried' {
     Assert-Equal 1 (Get-Calls) 'auth failure is NOT retried - it is not transient'
     Assert-Equal 'auth' (Get-StateValue 'LAST_STATUS') 'records auth'
     Assert-Equal $before (Get-StateValue 'WINDOW_END') 'window NOT advanced on auth failure'
-    Assert-Match (Get-LogText) 'AUTH\s+Failed to authenticate' 'logs the readable cause'
+    Assert-Match (Get-LogText) 'AUTH\s+401 Unauthorized' 'logs the readable cause'
 }
 
 Invoke-Test 'transient_error_recovers_within_one_run' {
@@ -318,6 +344,25 @@ Invoke-Test 'lock_released_after_run' {
     if (Test-Path -LiteralPath $lock) { Add-Failure 'lock directory left behind after a normal run' }
 }
 
+# A de-authed codex retries its connection for ~30s before giving up, and a
+# wedged one would otherwise hold the lock until something killed it.
+Invoke-Test 'hung_ping_is_killed_at_the_timeout' {
+    Set-StateWindow (Get-HoursAgoBoundary 6)
+    $before = Get-StateValue 'WINDOW_END'
+    $env:STUB_MODE = 'hang'
+    $env:KEEPWARM_PING_TIMEOUT = '3'
+    $env:KEEPWARM_PING_ATTEMPTS = '1'
+    $started = Get-Date
+    Invoke-Kw @('run') | Out-Null
+    $elapsed = ((Get-Date) - $started).TotalSeconds
+    Assert-Equal 'error' (Get-StateValue 'LAST_STATUS') 'records error'
+    Assert-Equal $before (Get-StateValue 'WINDOW_END') 'window NOT advanced on timeout'
+    Assert-Match (Get-LogText) 'ERROR\s+timed out' 'says it timed out'
+    if ($elapsed -gt 30) { Add-Failure "timeout did not fire: run took ${elapsed}s" }
+    $lock = Join-Path $env:KEEPWARM_HOME 'state\keepwarm.lock.d'
+    if (Test-Path -LiteralPath $lock) { Add-Failure 'lock left behind after a timed-out ping' }
+}
+
 Invoke-Test 'read_only_commands_make_no_calls' {
     Invoke-Kw @('version') | Out-Null
     Invoke-Kw @('config')  | Out-Null
@@ -333,7 +378,7 @@ Invoke-Test 'doctor_fails_without_task' {
 
 Invoke-Test 'dry_run_makes_no_call' {
     Invoke-Kw @('ping', '--dry-run') | Out-Null
-    Assert-Equal 0 (Get-Calls) '--dry-run does not call claude'
+    Assert-Equal 0 (Get-Calls) '--dry-run does not call codex'
 }
 
 # -------------------------------------------------------------------- main --

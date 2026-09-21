@@ -122,19 +122,19 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          # install refuses to run without a resolvable claude binary, so give
+          # install refuses to run without a resolvable codex binary, so give
           # it a stub — this step is about Task Scheduler, not about pinging.
-          $stub = Join-Path $env:RUNNER_TEMP 'claude.cmd'
+          $stub = Join-Path $env:RUNNER_TEMP 'codex.cmd'
           '@echo off' | Set-Content $stub -Encoding ASCII
-          $env:KEEPWARM_CLAUDE_BIN = $stub
+          $env:KEEPWARM_CODEX_BIN = $stub
 
           .\keepwarm.ps1 install
-          $t = Get-ScheduledTask -TaskName 'claude-keepwarm' -ErrorAction SilentlyContinue
+          $t = Get-ScheduledTask -TaskName 'codex-keepwarm' -ErrorAction SilentlyContinue
           if (-not $t) { throw 'task was not registered' }
           Write-Host "registered: $($t.TaskName) [$($t.State)]"
 
           .\keepwarm.ps1 uninstall
-          if (Get-ScheduledTask -TaskName 'claude-keepwarm' -ErrorAction SilentlyContinue) {
+          if (Get-ScheduledTask -TaskName 'codex-keepwarm' -ErrorAction SilentlyContinue) {
             throw 'task was not removed'
           }
           Write-Host 'unregistered cleanly'

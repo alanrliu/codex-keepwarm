@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
 #
-# keepwarm — keep Claude Code's 5-hour usage window rolling.
+# keepwarm — keep the Codex CLI's 5-hour usage window rolling.
 #
-# Claude Code's usage window starts at the top of the hour containing your
+# Codex's 5-hour usage window starts at the top of the hour containing your
 # FIRST message and lasts 5 hours. It does not tick while you are away. Idle
-# all night, start at 09:00, exhaust the quota by 10:00, and you wait until
+# all night, start at 09:00, exhaust the window by 10:00, and you wait until
 # 14:00 — having gained nothing from the idle hours.
 #
 # keepwarm sends one tiny prompt just after each window expires, so windows
 # tile back-to-back around the clock. You do not get more quota per window;
 # you get more windows per day.
 #
-# https://github.com/mamuncseru/claude-keepwarm
-# MIT licensed.
+# ChatGPT plans also enforce a WEEKLY limit that no amount of tiling gets
+# around. See docs/how-it-works.md — on Plus it binds long before the
+# 5-hour window does, which caps how much this tool can buy you.
+#
+# A port of claude-keepwarm (https://github.com/mamuncseru/claude-keepwarm)
+# to the Codex CLI. MIT licensed.
 #
 # Portability: targets bash 3.2 (macOS default) and both GNU and BSD
 # userlands. No arrays, no ${var,,}, no mapfile, no flock, no `find -quit`,
@@ -33,7 +37,7 @@ done
 HERE="$(cd -P "$(dirname "$_self")" && pwd)"
 unset _self _dir
 
-CRON_MARKER="# claude-keepwarm"
+CRON_MARKER="# codex-keepwarm"
 
 # ---------------------------------------------------------------- defaults --
 # Every value here can be overridden in config.env, and then again by a
@@ -42,19 +46,27 @@ CRON_MARKER="# claude-keepwarm"
 
 WINDOW_HOURS=5          # length of the usage window
 SLACK_MINUTES=2         # wait this long past the boundary before pinging
-MODEL="haiku"           # cheapest model opens the window just as well
+MODEL=""                # empty = whatever the CLI defaults to. The window is
+                        # account-wide, so the model does not change what a
+                        # ping opens; it only changes what the ping is billed at.
 CRON_MINUTE=2           # minute of the hour the cron job fires on
 LOG_RETENTION_DAYS=30
 
 PING_PROMPT="ping"
-PING_SYSTEM_PROMPT="You are a keepalive probe. Reply with exactly: ok"
 PING_ATTEMPTS=3         # transient local failures are retried in-process
 PING_RETRY_DELAY=20     # seconds between attempts
+PING_TIMEOUT=120        # seconds before a hung ping is killed
+
+# 1 = pass --ignore-user-config, so the ping ignores ~/.codex/config.toml:
+# no MCP servers, no profile, no custom model provider. Set to 0 if you point
+# Codex at a provider of your own — otherwise the ping would go to the default
+# one instead of yours.
+IGNORE_USER_CONFIG=1
 
 SKIP_IF_RECENTLY_ACTIVE=1
-ACTIVITY_DIR="$HOME/.claude/projects"
+ACTIVITY_DIR="$HOME/.codex/sessions"
 
-CLAUDE_BIN=""           # empty = auto-detect
+CODEX_BIN=""            # empty = auto-detect
 
 HOME_DIR="$HERE"        # where state/, logs/ and config.env live
 
@@ -68,8 +80,9 @@ fi
 
 # ...then the environment wins over it.
 for _v in WINDOW_HOURS SLACK_MINUTES MODEL CRON_MINUTE LOG_RETENTION_DAYS \
-          PING_PROMPT PING_SYSTEM_PROMPT PING_ATTEMPTS PING_RETRY_DELAY \
-          SKIP_IF_RECENTLY_ACTIVE ACTIVITY_DIR CLAUDE_BIN HOME_DIR; do
+          PING_PROMPT PING_ATTEMPTS PING_RETRY_DELAY PING_TIMEOUT \
+          IGNORE_USER_CONFIG SKIP_IF_RECENTLY_ACTIVE ACTIVITY_DIR \
+          CODEX_BIN HOME_DIR; do
     _env="KEEPWARM_$_v"
     if [ -n "${!_env:-}" ]; then eval "$_v=\${$_env}"; fi
 done
@@ -184,38 +197,42 @@ acquire_lock() {
 
 release_lock() { rm -rf "$LOCK_DIR" 2>/dev/null || true; }
 
-# Locate the claude binary. The VS Code / Cursor extensions bundle their own
-# copy and do not put it on PATH, which is common; the glob takes the newest
-# match so an extension update does not break the cron job.
+# Locate the codex binary. The standalone installer keeps its real binary in a
+# version-numbered directory under ~/.codex/packages and only symlinks the one
+# on PATH, and the IDE extensions bundle their own copy without adding it to
+# PATH at all; the globs take the newest match so an update does not break the
+# cron job. Ordering is last-match-wins, so PATH is checked first and the
+# fallbacks only fill in when it is absent.
 # Returns non-zero rather than exiting, so callers can log and carry on.
-resolve_claude_bin() {
-    if [ -n "$CLAUDE_BIN" ]; then
-        [ -x "$CLAUDE_BIN" ] && return 0
-        say "keepwarm: CLAUDE_BIN is set but not executable: $CLAUDE_BIN"
-        CLAUDE_BIN=""
+resolve_codex_bin() {
+    if [ -n "$CODEX_BIN" ]; then
+        [ -x "$CODEX_BIN" ] && return 0
+        say "keepwarm: CODEX_BIN is set but not executable: $CODEX_BIN"
+        CODEX_BIN=""
         return 1
     fi
 
     local candidate
-    candidate="$(command -v claude 2>/dev/null)"
-    if [ -n "$candidate" ]; then CLAUDE_BIN="$candidate"; return 0; fi
+    candidate="$(command -v codex 2>/dev/null)"
+    if [ -n "$candidate" ]; then CODEX_BIN="$candidate"; return 0; fi
 
     for candidate in \
-        "$HOME"/.vscode-server/extensions/anthropic.claude-code-*/resources/native-binary/claude \
-        "$HOME"/.vscode/extensions/anthropic.claude-code-*/resources/native-binary/claude \
-        "$HOME"/.cursor-server/extensions/anthropic.claude-code-*/resources/native-binary/claude \
-        "$HOME"/.cursor/extensions/anthropic.claude-code-*/resources/native-binary/claude \
-        "$HOME/.local/bin/claude" \
-        "$HOME/.claude/local/claude" \
-        "$HOME/.bun/bin/claude" \
-        /usr/local/bin/claude \
-        /opt/homebrew/bin/claude
+        "$HOME"/.vscode-server/extensions/openai.chatgpt-*/binaries/codex \
+        "$HOME"/.vscode/extensions/openai.chatgpt-*/binaries/codex \
+        "$HOME"/.cursor-server/extensions/openai.chatgpt-*/binaries/codex \
+        "$HOME"/.cursor/extensions/openai.chatgpt-*/binaries/codex \
+        "$HOME"/.codex/packages/standalone/releases/*/bin/codex \
+        "$HOME/.local/bin/codex" \
+        "$HOME/.bun/bin/codex" \
+        "$HOME/.npm-global/bin/codex" \
+        /usr/local/bin/codex \
+        /opt/homebrew/bin/codex
     do
-        [ -x "$candidate" ] && CLAUDE_BIN="$candidate"
+        [ -x "$candidate" ] && CODEX_BIN="$candidate"
     done
 
-    [ -n "$CLAUDE_BIN" ] && return 0
-    say "keepwarm: could not find the claude binary. Set CLAUDE_BIN in $CONFIG_FILE"
+    [ -n "$CODEX_BIN" ] && return 0
+    say "keepwarm: could not find the codex binary. Set CODEX_BIN in $CONFIG_FILE"
     return 1
 }
 
@@ -253,8 +270,9 @@ due_at() {
     if [ "$WINDOW_END" -eq 0 ]; then printf '0'; else printf '%s' $(( WINDOW_END + SLACK_SECONDS )); fi
 }
 
-# Did we use Claude Code ourselves after the window expired? If so the new
-# window is already open and a ping would be wasted.
+# Did we use Codex ourselves after the window expired? If so the new window is
+# already open and a ping would be wasted. Our own pings run with --ephemeral
+# and write no rollout file, so they can never be mistaken for real activity.
 #
 # `find -newermt @epoch` is GNU-only and `-quit` does not exist on BSD, so
 # stamp a reference file with touch -t (POSIX) and compare against that.
@@ -275,35 +293,98 @@ active_since_window_end() {
 # Collapse output to a single log-friendly line.
 oneline() { tr '\n\t' '  ' | tr -s ' ' | cut -c1-"${1:-1200}"; }
 
-# The CLI puts a human-readable explanation in the JSON "result" field. Pull it
-# out for messages a person will read; fall back to the raw head if the shape
-# is not what we expect.
+# `codex exec --json` ends a failed turn with
+#   {"type":"turn.failed","error":{"message":"..."}}
+# and emits {"type":"error","message":"..."} along the way. Pull the reason out
+# for messages a person will read; fall back to the raw head if the shape is
+# not what we expect. The anchored trailing brace matters: the message itself
+# often contains escaped quotes, so a non-greedy [^"]* would truncate it.
 result_message() {
     local msg
-    msg="$(sed -n 's/.*"result":"\([^"]*\)".*/\1/p' <<<"$1" | head -n 1)"
-    if [ -n "$msg" ]; then printf '%s' "$msg"; else oneline 200 <<<"$1"; fi
+    msg="$(sed -n 's/.*"turn\.failed","error":{"message":"\(.*\)"}}.*/\1/p' <<<"$1" | tail -n 1)"
+    [ -z "$msg" ] && msg="$(sed -n 's/.*"type":"error","message":"\(.*\)"}.*/\1/p' <<<"$1" | tail -n 1)"
+    if [ -n "$msg" ]; then
+        printf '%s' "$msg" | sed 's/\\"/"/g; s/\\n/ /g'
+    else
+        oneline 200 <<<"$1"
+    fi
 }
 
-# One ping attempt. Echoes: ok | limited | error
+# Run a command with a wall-clock limit, writing its combined output to a file.
+# timeout(1) is GNU-only, and a de-authed codex retries its connection for ~30s
+# before giving up, so without a ceiling a wedged ping would hold the lock until
+# something killed it. Backgrounding plus a polling wait is portable to macOS.
+# Echoes nothing; returns the command's status, or 124 if it was killed.
+run_limited() {
+    local limit="$1" out_file="$2"
+    shift 2
+    # stdin is closed deliberately: `codex exec` reads the prompt from stdin
+    # when stdin is not a TTY, and under cron that is the job's own stdin.
+    ( cd "$STATE_DIR" && exec "$@" </dev/null ) >"$out_file" 2>&1 &
+    local pid=$! waited=0
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$waited" -ge "$limit" ]; then
+            kill -TERM "$pid" 2>/dev/null
+            sleep 2
+            kill -KILL "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+            return 124
+        fi
+        sleep 1
+        waited=$(( waited + 1 ))
+    done
+    wait "$pid"
+}
+
+# Assemble the ping argv into the positional parameters. bash 3.2 has no
+# arrays worth using here, and the two optional flags make a fixed string
+# unworkable, so `set --` is the portable way to build it.
+#   --sandbox read-only    the ping must never be able to write to disk
+#   --skip-git-repo-check  the state directory is not necessarily a repo
+#   --ephemeral            no rollout file under ~/.codex/sessions
+#   --ignore-user-config   no config.toml: no MCP servers, no profile
+#   --json                 one event per line; turn.completed means success
+ping_argv() {
+    set -- exec "$PING_PROMPT" \
+        --sandbox read-only \
+        --skip-git-repo-check \
+        --ephemeral \
+        --color never \
+        --json
+    [ -n "$MODEL" ] && set -- "$@" --model "$MODEL"
+    [ "$IGNORE_USER_CONFIG" = "1" ] && set -- "$@" --ignore-user-config
+    printf '%s\n' "$@"
+}
+
+# One ping attempt. Echoes: ok | limited | auth | error
 do_ping_once() {
-    local out rc
-    # --safe-mode          no CLAUDE.md, skills, plugins, hooks, MCP (auth still works)
-    # --system-prompt      replaces Claude Code's ~15k-token default system prompt
-    # --tools=             no tool schemas in the request. The `=` form is
-    #                      deliberate: PowerShell 5.1 drops empty-string args
-    #                      to native exes, so `--tools ""` breaks the Windows
-    #                      port. This form behaves identically on both.
-    # --no-session-...     do not litter ~/.claude/projects with keepalive sessions
-    out="$(cd "$STATE_DIR" && "$CLAUDE_BIN" -p "$PING_PROMPT" \
-        --model "$MODEL" \
-        --safe-mode \
-        --disable-slash-commands \
-        --strict-mcp-config \
-        --no-session-persistence \
-        --system-prompt "$PING_SYSTEM_PROMPT" \
-        --tools= \
-        --output-format json 2>&1)"
+    local out rc out_file
+    out_file="$STATE_DIR/.ping-out"
+
+    # Word splitting on ping_argv's newline-separated output is intentional and
+    # safe: every element is a literal from the list above or a config value
+    # with no spaces. PING_PROMPT is passed separately for that reason.
+    local old_ifs="$IFS"
+    IFS='
+'
+    # shellcheck disable=SC2046
+    set -- $(ping_argv)
+    IFS="$old_ifs"
+
+    run_limited "$PING_TIMEOUT" "$out_file" "$CODEX_BIN" "$@"
     rc=$?
+    # `codex exec` announces that it is reading stdin whenever stdin is not a
+    # TTY, which under cron is always. It is pure noise on every ping, and it
+    # would otherwise be the first thing in every OK line.
+    out="$(sed '/^Reading additional input from stdin/d' "$out_file" 2>/dev/null)"
+    rm -f "$out_file" 2>/dev/null || true
+
+    if [ "$rc" -eq 124 ]; then
+        printf '%s\n' "ping exceeded PING_TIMEOUT (${PING_TIMEOUT}s)" >"$LAST_ERROR_FILE"
+        log "ERROR    timed out after ${PING_TIMEOUT}s :: $(oneline 400 <<<"$out")"
+        printf 'error'
+        return
+    fi
 
     # An exhausted window comes back as prose with a zero exit status, so match
     # the message as well as the exit code.
@@ -311,7 +392,7 @@ do_ping_once() {
     # Here-strings, not pipes: `grep -q` exits at the first match, which
     # SIGPIPEs the upstream writer, and under `set -o pipefail` that turns a
     # successful match into a non-zero pipeline status.
-    if grep -qiE 'usage limit|rate.?limit|limit reached|limit will reset|resets at' <<<"$out"; then
+    if grep -qiE "hit your usage limit|usage limit|rate.?limit|limit reached|limit_reached\"?: ?true|resets? (at|in)" <<<"$out"; then
         log "LIMITED  still inside a window; will retry next tick :: $(oneline 300 <<<"$out")"
         printf 'limited'
         return
@@ -320,14 +401,17 @@ do_ping_once() {
     # Authentication failures are NOT transient: the session stays expired until
     # a human signs in again. Retrying burns 40s and logs the same line three
     # times, so they get their own status and skip the retry loop.
-    if grep -qiE 'failed to authenticate|oauth session expired|authentication_error|invalid api key|please run /login|not logged in' <<<"$out"; then
+    if grep -qiE '401 unauthorized|missing bearer|not logged in|codex login|refresh token was rejected|failed to refresh token|invalid api key|authentication_error' <<<"$out"; then
         printf '%s\n' "$(result_message "$out")" >"$LAST_ERROR_FILE"
         log "AUTH     $(result_message "$out")"
         printf 'auth'
         return
     fi
 
-    if [ "$rc" -ne 0 ] || grep -q '"is_error":[[:space:]]*true' <<<"$out"; then
+    # A finished turn is the only positive signal: codex exits non-zero on a
+    # failed turn, but it also emits `error` events it then recovers from, so
+    # neither the status nor the presence of an error line decides this alone.
+    if [ "$rc" -ne 0 ] || ! grep -q '"type":"turn\.completed"' <<<"$out"; then
         # Log generously — a truncated payload hides the "result" field that
         # explains the failure, which is exactly what you need at 03:00.
         printf '%s\n' "$(result_message "$out")" >"$LAST_ERROR_FILE"
@@ -350,8 +434,8 @@ do_ping_once() {
 # (contended credentials file, transient network), and without an in-process
 # retry a single blip costs a whole hour of window.
 do_ping() {
-    if [ -z "$CLAUDE_BIN" ] || [ ! -x "$CLAUDE_BIN" ]; then
-        log "ERROR    claude binary not found; set CLAUDE_BIN in $CONFIG_FILE"
+    if [ -z "$CODEX_BIN" ] || [ ! -x "$CODEX_BIN" ]; then
+        log "ERROR    codex binary not found; set CODEX_BIN in $CONFIG_FILE"
         printf 'error'
         return
     fi
@@ -408,7 +492,7 @@ cmd_run() {
     fi
 
     LAST_PING="$now"
-    resolve_claude_bin 2>/dev/null || true
+    resolve_codex_bin 2>/dev/null || true
     status="$(do_ping)"
     LAST_STATUS="$status"
 
@@ -434,16 +518,20 @@ cmd_ping() {
     now="$(now_epoch)"
 
     if [ "${1:-}" = "--dry-run" ]; then
-        resolve_claude_bin || true
+        resolve_codex_bin || true
         say "would run:"
-        say "  ${CLAUDE_BIN:-<claude>} -p '$PING_PROMPT' --model $MODEL --safe-mode \\"
-        say "    --disable-slash-commands --strict-mcp-config --no-session-persistence \\"
-        say "    --system-prompt '$PING_SYSTEM_PROMPT' --tools= --output-format json"
+        local a line=""
+        # Re-join the argv into one readable command line: each flag keeps its
+        # value beside it, which one-arg-per-line output loses.
+        while IFS= read -r a; do line="$line $a"; done <<<"$(ping_argv)"
+        say "  ${CODEX_BIN:-<codex>}$line </dev/null"
+        say ""
+        say "  run from $STATE_DIR"
         return 0
     fi
 
-    resolve_claude_bin || die "cannot ping without the claude binary"
-    say "pinging with model '$MODEL'..."
+    resolve_codex_bin || die "cannot ping without the codex binary"
+    say "pinging with model ${MODEL:-'(codex default)'}..."
     LAST_PING="$now"
     status="$(do_ping)"
     LAST_STATUS="$status"
@@ -463,8 +551,8 @@ cmd_ping() {
             say ""
             say "not authenticated: $(cat "$LAST_ERROR_FILE" 2>/dev/null || printf 'the CLI could not authenticate')"
             say ""
-            say "Your Claude Code login has expired. Sign in again, then retry:"
-            say "    claude          # then use /login"
+            say "Your Codex login has expired. Sign in again, then retry:"
+            say "    codex login     # or: codex login --device-auth, if headless"
             say "    keepwarm ping"
             return 3
             ;;
@@ -479,15 +567,15 @@ cmd_ping() {
 
 cmd_status() {
     load_state
-    resolve_claude_bin 2>/dev/null || true
+    resolve_codex_bin 2>/dev/null || true
 
     local now due
     now="$(now_epoch)"
     due="$(due_at)"
 
     printf 'keepwarm %s\n\n' "$KEEPWARM_VERSION"
-    printf '  claude binary   %s\n' "${CLAUDE_BIN:-NOT FOUND}"
-    printf '  model           %s\n' "$MODEL"
+    printf '  codex binary    %s\n' "${CODEX_BIN:-NOT FOUND}"
+    printf '  model           %s\n' "${MODEL:-(codex default)}"
     printf '  window length   %sh (+%sm slack)\n\n' "$WINDOW_HOURS" "$SLACK_MINUTES"
 
     if [ "$WINDOW_END" -eq 0 ]; then
@@ -538,10 +626,10 @@ cmd_doctor() {
 
     printf 'keepwarm %s — doctor\n\n' "$KEEPWARM_VERSION"
 
-    if resolve_claude_bin 2>/dev/null; then
-        check ok "claude binary" "$CLAUDE_BIN"
+    if resolve_codex_bin 2>/dev/null; then
+        check ok "codex binary" "$CODEX_BIN"
     else
-        check fail "claude binary" "not found — set CLAUDE_BIN in $CONFIG_FILE"
+        check fail "codex binary" "not found — set CODEX_BIN in $CONFIG_FILE"
     fi
 
     if cron_installed; then
@@ -619,7 +707,7 @@ cron_daemon_running() {
 }
 
 cmd_install() {
-    resolve_claude_bin || die "fix CLAUDE_BIN in $CONFIG_FILE before installing"
+    resolve_codex_bin || die "fix CODEX_BIN in $CONFIG_FILE before installing"
     command -v crontab >/dev/null 2>&1 || die "crontab not found; see README for a systemd-timer alternative"
 
     local line existing
@@ -633,7 +721,7 @@ cmd_install() {
     say "installed hourly cron job:"
     say "  $line"
     say ""
-    say "It checks every hour and only calls Claude when the window has actually"
+    say "It checks every hour and only calls Codex when the window has actually"
     say "expired, so a missed run (machine asleep, cron down) self-corrects."
 
     load_state
@@ -679,23 +767,24 @@ cmd_uninstall() {
 }
 
 cmd_config() {
-    resolve_claude_bin 2>/dev/null || true
+    resolve_codex_bin 2>/dev/null || true
     printf 'keepwarm %s (%s date)\n\n' "$KEEPWARM_VERSION" "$DATE_FLAVOR"
     printf '%-24s %s%s\n' "config file" "$CONFIG_FILE" \
         "$([ -f "$CONFIG_FILE" ] || printf ' (absent, using defaults)')"
-    printf '%-24s %s\n' "claude bin" "${CLAUDE_BIN:-NOT FOUND}"
+    printf '%-24s %s\n' "codex bin" "${CODEX_BIN:-NOT FOUND}"
     printf '%-24s %s\n' "state" "$STATE_FILE"
     printf '%-24s %s\n\n' "log" "$LOG_FILE"
     local v
     for v in WINDOW_HOURS SLACK_MINUTES MODEL CRON_MINUTE LOG_RETENTION_DAYS \
-             PING_ATTEMPTS PING_RETRY_DELAY SKIP_IF_RECENTLY_ACTIVE ACTIVITY_DIR; do
+             PING_ATTEMPTS PING_RETRY_DELAY PING_TIMEOUT IGNORE_USER_CONFIG \
+             SKIP_IF_RECENTLY_ACTIVE ACTIVITY_DIR; do
         printf '%-24s %s\n' "$v" "${!v}"
     done
 }
 
 usage() {
     cat <<EOF
-keepwarm $KEEPWARM_VERSION — keep Claude Code's 5-hour usage window rolling
+keepwarm $KEEPWARM_VERSION — keep the Codex CLI's 5-hour usage window rolling
 
   keepwarm install          install the hourly cron job
   keepwarm ping             open a window now; also re-phases your boundaries
@@ -703,14 +792,14 @@ keepwarm $KEEPWARM_VERSION — keep Claude Code's 5-hour usage window rolling
   keepwarm status           current window, next ping, recent log
 
   keepwarm run              ping only if the window expired (what cron calls)
-  keepwarm ping --dry-run   print the exact command without calling Claude
+  keepwarm ping --dry-run   print the exact command without calling Codex
   keepwarm log [n]          last n log lines (default 40)
   keepwarm config           resolved settings and paths
   keepwarm uninstall        remove the cron job (add --purge to drop state too)
   keepwarm version          print the version
 
 Configure by copying config.env.example to config.env next to this script.
-https://github.com/mamuncseru/claude-keepwarm
+https://github.com/alanrliu/codex-keepwarm
 EOF
 }
 

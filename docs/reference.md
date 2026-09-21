@@ -12,7 +12,7 @@ On Windows, every command is identical with `.\keepwarm.ps1` in place of
 | `keepwarm doctor` | Health check: binary, schedule, daemon, heartbeat, window |
 | `keepwarm status` | Current window, next ping, recent log |
 | `keepwarm run` | Ping only if the window expired (what the scheduler calls) |
-| `keepwarm ping --dry-run` | Print the exact command without calling Claude |
+| `keepwarm ping --dry-run` | Print the exact command without calling Codex |
 | `keepwarm log [n]` | Last n log lines (default 40) |
 | `keepwarm config` | Resolved settings and paths |
 | `keepwarm uninstall` | Remove the schedule, keep state |
@@ -26,7 +26,7 @@ On Windows, every command is identical with `.\keepwarm.ps1` in place of
 | `0` | Success |
 | `1` | Failure — `doctor` found a failing check, or `ping` errored |
 | `2` | `ping` was rate-limited (you're inside a live window; nothing lost) |
-| `3` | `ping` could not authenticate - sign in again |
+| `3` | `ping` could not authenticate - run `codex login` |
 
 ## Log lines
 
@@ -38,7 +38,7 @@ heartbeat.
 | `WAIT` | Tick ran, window still live, nothing spent |
 | `OK` / `WINDOW` | Ping succeeded, a new window opened |
 | `SKIP` | You were already active after the boundary, or another run held the lock |
-| `LIMITED` | Still inside a window — state untouched, will retry next tick |
+| `LIMITED` | Still inside a window, or the weekly limit is spent — state untouched, will retry next tick |
 | `RETRY` | Transient failure, retrying within this run |
 | `ERROR` | Ping failed; the payload is logged up to 1200 chars |
 
@@ -59,20 +59,21 @@ commented out by default.
 | `WINDOW_HOURS` | `5` | Length of the usage window |
 | `SLACK_MINUTES` | `2` | Delay past the boundary before pinging. Raise to 5 if you see `LIMITED` |
 | `CRON_MINUTE` | `2` | Minute of the hour the job fires on |
-| `MODEL` | `haiku` | The window is account-wide, so the cheapest model opens it just as well |
+| `MODEL` | *(empty)* | Empty means the CLI's own default. The window is account-wide, so the model only changes what the ping is billed at |
 | `PING_PROMPT` | `ping` | The keepalive prompt |
-| `PING_SYSTEM_PROMPT` | *(see file)* | Replaces Claude Code's default — this is the main cost saving |
 | `PING_ATTEMPTS` | `3` | In-process retries for transient failures |
 | `PING_RETRY_DELAY` | `20` | Seconds between attempts |
+| `PING_TIMEOUT` | `120` | Seconds before a hung ping is killed |
+| `IGNORE_USER_CONFIG` | `1` | Pass `--ignore-user-config`. Set to `0` if you use a custom model provider |
 | `SKIP_IF_RECENTLY_ACTIVE` | `1` | Don't spend a ping if your own messages already opened the window |
-| `ACTIVITY_DIR` | `~/.claude/projects` | Where the activity check looks |
-| `CLAUDE_BIN` | auto | Pin the binary if auto-detection picks wrong |
+| `ACTIVITY_DIR` | `~/.codex/sessions` | Where the activity check looks |
+| `CODEX_BIN` | auto | Pin the binary if auto-detection picks wrong |
 | `LOG_RETENTION_DAYS` | `30` | Log pruning |
 
 Any setting can also be overridden for one invocation with a `KEEPWARM_` prefix:
 
 ```sh
-KEEPWARM_MODEL=sonnet ./keepwarm ping
+KEEPWARM_MODEL=gpt-5.6-luna ./keepwarm ping
 ```
 
 Precedence is **defaults → `config.env` → environment**.
@@ -121,25 +122,25 @@ whenever you like.
     === "macOS / Linux"
 
         ```sh
-        crontab -l | grep -v claude-keepwarm | crontab -
+        crontab -l | grep -v codex-keepwarm | crontab -
         ```
 
     === "Windows"
 
         ```powershell
-        Unregister-ScheduledTask -TaskName claude-keepwarm -Confirm:$false
+        Unregister-ScheduledTask -TaskName codex-keepwarm -Confirm:$false
         ```
 
 ### Verify it's gone
 
 ```sh
-crontab -l | grep claude-keepwarm            # macOS / Linux: expect no output
-Get-ScheduledTask -TaskName claude-keepwarm  # Windows: expect "not found"
+crontab -l | grep codex-keepwarm            # macOS / Linux: expect no output
+Get-ScheduledTask -TaskName codex-keepwarm  # Windows: expect "not found"
 ```
 
 keepwarm holds no credentials, installs nothing outside its own folder, and
-changes no Claude Code settings - so once the schedule is gone, nothing of it
-is left running.
+changes no Codex settings - so once the schedule is gone, nothing of it is left
+running.
 
 ## Troubleshooting
 
@@ -155,13 +156,13 @@ is left running.
     `SLACK_MINUTES` to 5. Nothing is lost when this happens — state is left
     untouched and the next tick retries.
 
-??? question "`not authenticated` / `Failed to authenticate: OAuth session expired`"
+??? question "`not authenticated` / `401 Unauthorized`"
 
-    Your Claude Code login has expired. keepwarm can't refresh it for you - it
-    holds no credentials of its own. Sign in again and retry:
+    Your Codex login has expired. keepwarm can't refresh it for you - it holds
+    no credentials of its own. Sign in again and retry:
 
     ```sh
-    claude          # then use /login
+    codex login     # or: codex login --device-auth, if headless
     keepwarm ping
     ```
 
@@ -169,9 +170,9 @@ is left running.
     expired until a human signs in, so retrying just burns time and fills the
     log. `doctor` reports it as a failing check until the next successful ping.
 
-??? question "`claude binary not found`"
+??? question "`codex binary not found`"
 
-    Auto-detection didn't find the CLI. Set `CLAUDE_BIN` in `config.env` to the
+    Auto-detection didn't find the CLI. Set `CODEX_BIN` in `config.env` to the
     full path. `./keepwarm config` shows what it resolved.
 
 ??? question "Can I run it on more than one machine?"
@@ -179,6 +180,13 @@ is left running.
     The window is account-wide but the state file is local, so two machines
     would ping independently. It's harmless — the second one sees a live window
     and waits — but pick one machine that's reliably awake.
+
+??? question "The log keeps showing `LIMITED` and my window is definitely over"
+
+    Then it's the weekly limit, not the 5-hour one, and there is nothing to
+    tile. keepwarm will keep trying hourly and will start succeeding again when
+    the week rolls over. See
+    [Two limits, not one](how-it-works.md#two-limits-not-one).
 
 ??? question "Does this break my plan's terms?"
 
@@ -189,17 +197,18 @@ is left running.
 ## Development
 
 ```sh
-./tests/run.sh          # 25 tests — no network, no API calls, no real crontab
+./tests/run.sh          # 28 tests — no network, no API calls, no real crontab
 ./tests/run.sh lock     # filter by name
 shellcheck -s bash keepwarm tests/run.sh
 ```
 
 ```powershell
-.\tests\run.ps1         # 16 tests, same coverage on the Windows port
+.\tests\run.ps1         # 17 tests, same coverage on the Windows port
 ```
 
-Tests run in a throwaway sandbox with a stub `claude` and a fake `crontab`, so
-`install` / `uninstall` are exercised without touching your real schedule.
+Tests run in a throwaway sandbox with a stub `codex` and a fake `crontab`, so
+`install` / `uninstall` are exercised without touching your real schedule. The
+stub speaks the same JSONL event stream `codex exec --json` does.
 
 CI covers:
 

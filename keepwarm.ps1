@@ -1,12 +1,15 @@
 ﻿<#
 .SYNOPSIS
-    keepwarm - keep Claude Code's 5-hour usage window rolling. (Windows port)
+    keepwarm - keep the Codex CLI's 5-hour usage window rolling. (Windows port)
 
 .DESCRIPTION
-    Claude Code's usage window starts at the top of the hour containing your
+    Codex's 5-hour usage window starts at the top of the hour containing your
     FIRST message and lasts 5 hours. It does not tick while you are away. Idle
-    all night, start at 09:00, exhaust the quota by 10:00, and you wait until
+    all night, start at 09:00, exhaust the window by 10:00, and you wait until
     14:00 - having gained nothing from the idle hours.
+
+    ChatGPT plans also enforce a WEEKLY limit that no amount of tiling gets
+    around; on Plus it binds long before the 5-hour window does.
 
     keepwarm sends one tiny prompt just after each window expires, so windows
     tile back-to-back around the clock. You do not get more quota per window;
@@ -22,7 +25,7 @@
     .\keepwarm.ps1 doctor
 
 .LINK
-    https://github.com/mamuncseru/claude-keepwarm
+    https://github.com/alanrliu/codex-keepwarm
 #>
 #Requires -Version 5.1
 [CmdletBinding()]
@@ -40,7 +43,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $KeepwarmVersion = '1.0.0'
-$TaskName        = 'claude-keepwarm'
+$TaskName        = 'codex-keepwarm'
 
 # --------------------------------------------------------------------- paths --
 
@@ -50,6 +53,11 @@ $ScriptDir  = Split-Path -Parent $ScriptPath
 # $env:USERPROFILE is null off Windows, and Join-Path throws on a null Path -
 # which crashed the script at load time before it printed anything.
 $UserHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
+
+# $IsWindows does not exist on 5.1 Desktop, and StrictMode makes reading it an
+# error, so the Desktop test has to short-circuit before it is touched.
+$IsWindowsHost = if ($PSVersionTable.PSEdition -eq 'Desktop') { $true } else { [bool]$IsWindows }
+$NullDevice    = if ($IsWindowsHost) { 'NUL' } else { '/dev/null' }
 
 $HomeDir = if ($env:KEEPWARM_HOME) { $env:KEEPWARM_HOME } else { $ScriptDir }
 $StateDir  = Join-Path $HomeDir 'state'
@@ -70,16 +78,17 @@ New-Item -ItemType Directory -Force -Path $StateDir, $LogDir | Out-Null
 $Config = @{
     WINDOW_HOURS            = 5
     SLACK_MINUTES           = 2
-    MODEL                   = 'haiku'
+    MODEL                   = ''
     CRON_MINUTE             = 2
     LOG_RETENTION_DAYS      = 30
     PING_PROMPT             = 'ping'
-    PING_SYSTEM_PROMPT      = 'You are a keepalive probe. Reply with exactly: ok'
     PING_ATTEMPTS           = 3
     PING_RETRY_DELAY        = 20
+    PING_TIMEOUT            = 120
+    IGNORE_USER_CONFIG      = 1
     SKIP_IF_RECENTLY_ACTIVE = 1
-    ACTIVITY_DIR            = (Join-Path (Join-Path $UserHome '.claude') 'projects')
-    CLAUDE_BIN              = ''
+    ACTIVITY_DIR            = (Join-Path (Join-Path $UserHome '.codex') 'sessions')
+    CODEX_BIN               = ''
 }
 
 if (Test-Path -LiteralPath $ConfigFile) {
@@ -144,15 +153,17 @@ function Write-KwLog {
 
 function Write-Say { param([string]$Message = '') Write-Host $Message }
 
-# The CLI puts a human-readable explanation in the JSON "result" field. Pull it
-# out for messages a person will read; fall back to the raw head.
+# `codex exec --json` ends a failed turn with
+#   {"type":"turn.failed","error":{"message":"..."}}
+# and emits {"type":"error","message":"..."} along the way. Pull the reason out
+# for messages a person will read; fall back to the raw head. The anchored
+# trailing brace matters: the message itself often contains escaped quotes.
 function Get-ResultMessage {
     param([string]$Text = '')
-    try {
-        $o = $Text | ConvertFrom-Json -ErrorAction Stop
-        if ($o.PSObject.Properties.Name -contains 'result' -and $o.result) { return [string]$o.result }
-    } catch { }
-    if ($Text -match '"result"\s*:\s*"([^"]*)"') { return $Matches[1] }
+    $m = [regex]::Matches($Text, '"turn\.failed","error":\{"message":"(.*)"\}\}')
+    if ($m.Count -gt 0) { return ($m[$m.Count - 1].Groups[1].Value -replace '\\"', '"') }
+    $m = [regex]::Matches($Text, '"type":"error","message":"(.*)"\}')
+    if ($m.Count -gt 0) { return ($m[$m.Count - 1].Groups[1].Value -replace '\\"', '"') }
     Format-OneLine -Text $Text -Max 200
 }
 
@@ -163,39 +174,39 @@ function Format-OneLine {
     if ($t.Length -gt $Max) { $t.Substring(0, $Max) } else { $t }
 }
 
-# ------------------------------------------------------------- claude binary --
+# -------------------------------------------------------------- codex binary --
 
-function Resolve-ClaudeBin {
-    if ($Config.CLAUDE_BIN) {
-        if (Test-Path -LiteralPath $Config.CLAUDE_BIN) { return $Config.CLAUDE_BIN }
-        Write-Say "keepwarm: CLAUDE_BIN is set but not found: $($Config.CLAUDE_BIN)"
+function Resolve-CodexBin {
+    if ($Config.CODEX_BIN) {
+        if (Test-Path -LiteralPath $Config.CODEX_BIN) { return $Config.CODEX_BIN }
+        Write-Say "keepwarm: CODEX_BIN is set but not found: $($Config.CODEX_BIN)"
         return $null
     }
 
-    $onPath = Get-Command claude -ErrorAction SilentlyContinue
+    $onPath = Get-Command codex -ErrorAction SilentlyContinue
     if ($onPath) { return $onPath.Source }
 
-    # The VS Code / Cursor extensions bundle their own copy in a
-    # version-numbered directory and do not add it to PATH. Sort descending so
-    # an extension update does not break the scheduled task.
+    # The standalone installer keeps the real binary in a version-numbered
+    # directory, and the IDE extensions bundle their own copy without adding it
+    # to PATH. Sort descending so an update does not break the scheduled task.
     # Built conditionally: a null base would throw rather than just not match.
     # Forward slashes are accepted on Windows too.
     $globs = @()
     if ($UserHome) {
-        $globs += (Join-Path $UserHome '.vscode/extensions/anthropic.claude-code-*/resources/native-binary/claude.exe')
-        $globs += (Join-Path $UserHome '.cursor/extensions/anthropic.claude-code-*/resources/native-binary/claude.exe')
-        $globs += (Join-Path $UserHome '.local/bin/claude.exe')
-        $globs += (Join-Path $UserHome '.claude/local/claude.exe')
-        $globs += (Join-Path $UserHome '.bun/bin/claude.exe')
+        $globs += (Join-Path $UserHome '.vscode/extensions/openai.chatgpt-*/binaries/codex.exe')
+        $globs += (Join-Path $UserHome '.cursor/extensions/openai.chatgpt-*/binaries/codex.exe')
+        $globs += (Join-Path $UserHome '.codex/packages/standalone/releases/*/bin/codex.exe')
+        $globs += (Join-Path $UserHome '.local/bin/codex.exe')
+        $globs += (Join-Path $UserHome '.bun/bin/codex.exe')
     }
-    if ($env:APPDATA) { $globs += (Join-Path $env:APPDATA 'npm/claude.cmd') }
+    if ($env:APPDATA) { $globs += (Join-Path $env:APPDATA 'npm/codex.cmd') }
     foreach ($g in $globs) {
         $hit = Get-ChildItem -Path $g -ErrorAction SilentlyContinue |
                Sort-Object FullName -Descending | Select-Object -First 1
         if ($hit) { return $hit.FullName }
     }
 
-    Write-Say "keepwarm: could not find claude. Set CLAUDE_BIN in $ConfigFile"
+    Write-Say "keepwarm: could not find codex. Set CODEX_BIN in $ConfigFile"
     return $null
 }
 
@@ -274,8 +285,9 @@ function Exit-KwLock {
 
 # ------------------------------------------------------------------ activity --
 
-# Did we use Claude Code ourselves after the window expired? Then the new
-# window is already open and a ping would be wasted.
+# Did we use Codex ourselves after the window expired? Then the new window is
+# already open and a ping would be wasted. keepwarm's own pings run with
+# --ephemeral and write no rollout file, so they never look like activity.
 function Test-RecentActivity {
     param([Parameter(Mandatory)][hashtable]$State)
     if ([int]$Config.SKIP_IF_RECENTLY_ACTIVE -ne 1) { return $false }
@@ -290,51 +302,99 @@ function Test-RecentActivity {
 
 # ---------------------------------------------------------------------- ping --
 
-# One attempt. Returns 'ok' | 'limited' | 'error'.
+# The ping argv. Kept in one place so `ping --dry-run` can print exactly what
+# `run` would execute.
+#   --sandbox read-only    the ping must never be able to write to disk
+#   --skip-git-repo-check  the state directory is not necessarily a repo
+#   --ephemeral            no rollout file under ~/.codex/sessions
+#   --ignore-user-config   no config.toml: no MCP servers, no profile
+#   --json                 one event per line; turn.completed means success
+function Get-PingArgs {
+    $a = @(
+        'exec', $Config.PING_PROMPT
+        '--sandbox', 'read-only'
+        '--skip-git-repo-check'
+        '--ephemeral'
+        '--color', 'never'
+        '--json'
+    )
+    # Only appended when set: PowerShell 5.1 silently drops empty-string
+    # arguments to native executables, which would leave a dangling --model.
+    if ($Config.MODEL) { $a += @('--model', $Config.MODEL) }
+    if ([int]$Config.IGNORE_USER_CONFIG -eq 1) { $a += '--ignore-user-config' }
+    $a
+}
+
+# One attempt. Returns 'ok' | 'limited' | 'auth' | 'error'.
 function Invoke-PingOnce {
     param([Parameter(Mandatory)][string]$Bin)
 
-    $cliArgs = @(
-        '-p', $Config.PING_PROMPT
-        '--model', $Config.MODEL
-        '--safe-mode'
-        '--disable-slash-commands'
-        '--strict-mcp-config'
-        '--no-session-persistence'
-        '--system-prompt', $Config.PING_SYSTEM_PROMPT
-        # `--tools=` not `--tools ""`: PowerShell 5.1 silently drops
-        # empty-string arguments to native executables.
-        '--tools='
-        '--output-format', 'json'
-    )
-
+    $cliArgs = Get-PingArgs
+    $outFile = Join-Path $StateDir '.ping-out'
+    $errFile = Join-Path $StateDir '.ping-err'
     $raw = ''
     $rc = 0
+    $timedOut = $false
+
     try {
-        $prev = $ErrorActionPreference
-        $ErrorActionPreference = 'Continue'   # native stderr must not throw
-        $raw = (& $Bin @cliArgs 2>&1 | Out-String)
-        $rc = $LASTEXITCODE
-        $ErrorActionPreference = $prev
+        # Start-Process rather than the call operator, because a hung ping has
+        # to be killable: a de-authed codex retries its connection for ~30s,
+        # and a wedged one would otherwise hold the lock indefinitely.
+        # NUL for stdin: `codex exec` reads the prompt from stdin when stdin is
+        # not a console, which under Task Scheduler it never is.
+        $proc = Start-Process -FilePath $Bin -ArgumentList $cliArgs `
+            -WorkingDirectory $StateDir -NoNewWindow -PassThru `
+            -RedirectStandardInput $NullDevice `
+            -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        if (-not $proc.WaitForExit([int]$Config.PING_TIMEOUT * 1000)) {
+            $timedOut = $true
+            try { $proc.Kill() } catch { }
+            $proc.WaitForExit(5000) | Out-Null
+        } else {
+            # The no-argument overload as well: after only the timed wait,
+            # ExitCode can still be unpopulated on a Start-Process object.
+            $proc.WaitForExit()
+            $rc = $proc.ExitCode
+        }
     } catch {
         Write-KwLog "ERROR    invocation failed :: $(Format-OneLine -Text $_.Exception.Message -Max 400)"
         return 'error'
     }
 
-    if ($raw -match '(?i)usage limit|rate.?limit|limit reached|limit will reset|resets at') {
+    foreach ($f in @($outFile, $errFile)) {
+        if (Test-Path -LiteralPath $f) {
+            $raw += (Get-Content -LiteralPath $f -Raw -ErrorAction SilentlyContinue)
+            Remove-Item -LiteralPath $f -ErrorAction SilentlyContinue
+        }
+    }
+    # codex announces this whenever stdin is not a console, which is always
+    # here. Pure noise, and it would otherwise head every OK line.
+    $raw = ($raw -replace '(?m)^Reading additional input from stdin\.\.\.\r?\n', '')
+
+    if ($timedOut) {
+        Set-Content -LiteralPath $LastErrorFile -Encoding ASCII `
+            -Value "ping exceeded PING_TIMEOUT ($($Config.PING_TIMEOUT)s)"
+        Write-KwLog "ERROR    timed out after $($Config.PING_TIMEOUT)s :: $(Format-OneLine -Text $raw -Max 400)"
+        return 'error'
+    }
+
+    if ($raw -match '(?i)hit your usage limit|usage limit|rate.?limit|limit reached|limit_reached.{0,3}true|resets? (at|in)') {
         Write-KwLog "LIMITED  still inside a window; will retry next tick :: $(Format-OneLine -Text $raw -Max 300)"
         return 'limited'
     }
     # Authentication failures are NOT transient: the session stays expired
     # until a human signs in again, so they skip the retry loop entirely.
-    if ($raw -match '(?i)failed to authenticate|oauth session expired|authentication_error|invalid api key|please run /login|not logged in') {
+    if ($raw -match '(?i)401 unauthorized|missing bearer|not logged in|codex login|refresh token was rejected|failed to refresh token|invalid api key|authentication_error') {
         $msg = Get-ResultMessage -Text $raw
         Set-Content -LiteralPath $LastErrorFile -Value $msg -Encoding ASCII
         Write-KwLog "AUTH     $msg"
         return 'auth'
     }
 
-    if ($rc -ne 0 -or $raw -match '"is_error"\s*:\s*true') {
+    # A finished turn is the only positive signal: codex exits non-zero on a
+    # failed turn, but it also emits `error` events it then recovers from, so
+    # neither the status nor the presence of an error line decides this alone.
+    if ($rc -ne 0 -or $raw -notmatch '"type":"turn\.completed"') {
         Set-Content -LiteralPath $LastErrorFile -Value (Get-ResultMessage -Text $raw) -Encoding ASCII
         Write-KwLog "ERROR    rc=$rc :: $(Format-OneLine -Text $raw -Max 1200)"
         return 'error'
@@ -349,9 +409,9 @@ function Invoke-PingOnce {
 # the old window has not actually expired, and the next hourly tick is the
 # right place to try again.
 function Invoke-Ping {
-    $bin = Resolve-ClaudeBin
+    $bin = Resolve-CodexBin
     if (-not $bin) {
-        Write-KwLog "ERROR    claude binary not found; set CLAUDE_BIN in $ConfigFile"
+        Write-KwLog "ERROR    codex binary not found; set CODEX_BIN in $ConfigFile"
         return 'error'
     }
 
@@ -447,15 +507,15 @@ function Invoke-CmdPing {
     $state = Get-KwState
 
     if ($PingArgs -contains '--dry-run') {
-        $bin = Resolve-ClaudeBin
+        $bin = Resolve-CodexBin
         Write-Say 'would run:'
-        Write-Say "  $(if ($bin) { $bin } else { '<claude>' }) -p '$($Config.PING_PROMPT)' --model $($Config.MODEL) --safe-mode ``"
-        Write-Say "    --disable-slash-commands --strict-mcp-config --no-session-persistence ``"
-        Write-Say "    --system-prompt '$($Config.PING_SYSTEM_PROMPT)' --tools= --output-format json"
+        Write-Say "  $(if ($bin) { $bin } else { '<codex>' }) $((Get-PingArgs) -join ' ') <NUL"
+        Write-Say ''
+        Write-Say "  run from $StateDir"
         return 0
     }
 
-    Write-Say "pinging with model '$($Config.MODEL)'..."
+    Write-Say "pinging with model $(if ($Config.MODEL) { "'$($Config.MODEL)'" } else { '(codex default)' })..."
     $state.LAST_PING = Get-NowEpoch
     $status = Invoke-Ping
     $state.LAST_STATUS = $status
@@ -477,8 +537,8 @@ function Invoke-CmdPing {
             Write-Say ''
             Write-Say "not authenticated: $(if ($detail) { $detail } else { 'the CLI could not authenticate' })"
             Write-Say ''
-            Write-Say 'Your Claude Code login has expired. Sign in again, then retry:'
-            Write-Say '    claude                  # then use /login'
+            Write-Say 'Your Codex login has expired. Sign in again, then retry:'
+            Write-Say '    codex login             # or --device-auth, if headless'
             Write-Say '    .\keepwarm.ps1 ping'
             return 3
         }
@@ -494,14 +554,14 @@ function Invoke-CmdPing {
 
 function Invoke-CmdStatus {
     $state = Get-KwState
-    $bin = Resolve-ClaudeBin
+    $bin = Resolve-CodexBin
     $now = Get-NowEpoch
     $due = Get-DueEpoch -State $state
 
     Write-Say "keepwarm $KeepwarmVersion (windows)"
     Write-Say ''
-    Write-Say ("  claude binary   {0}" -f $(if ($bin) { $bin } else { 'NOT FOUND' }))
-    Write-Say ("  model           {0}" -f $Config.MODEL)
+    Write-Say ("  codex binary    {0}" -f $(if ($bin) { $bin } else { 'NOT FOUND' }))
+    Write-Say ("  model           {0}" -f $(if ($Config.MODEL) { $Config.MODEL } else { '(codex default)' }))
     Write-Say ("  window length   {0}h (+{1}m slack)" -f $Config.WINDOW_HOURS, $Config.SLACK_MINUTES)
     Write-Say ''
 
@@ -553,9 +613,9 @@ function Invoke-CmdDoctor {
     Write-Say "keepwarm $KeepwarmVersion - doctor (windows)"
     Write-Say ''
 
-    $bin = Resolve-ClaudeBin
-    if ($bin) { Write-Check ok 'claude binary' $bin }
-    else { Write-Check fail 'claude binary' "not found - set CLAUDE_BIN in $ConfigFile" }
+    $bin = Resolve-CodexBin
+    if ($bin) { Write-Check ok 'codex binary' $bin }
+    else { Write-Check fail 'codex binary' "not found - set CODEX_BIN in $ConfigFile" }
 
     $task = Get-KwTask
     if ($task) { Write-Check ok 'scheduled task' "$TaskName ($($task.State))" }
@@ -593,7 +653,7 @@ function Invoke-CmdDoctor {
         $detail = (if (Test-Path -LiteralPath $LastErrorFile) { (Get-Content -LiteralPath $LastErrorFile -Raw).Trim() } else { '' })
         Write-Check fail 'authentication' $(if ($detail) { $detail } else { 'last ping could not authenticate' })
         Write-Say ''
-        Write-Say "  Sign in again: run 'claude', use /login, then '.\keepwarm.ps1 ping'"
+        Write-Say "  Sign in again: run 'codex login', then '.\keepwarm.ps1 ping'"
     }
 
     if ($task) {
@@ -614,8 +674,8 @@ function Invoke-CmdInstall {
     if (-not (Test-HasTaskCmdlets)) {
         throw 'Task Scheduler cmdlets are unavailable. On macOS/Linux use the ./keepwarm script instead.'
     }
-    $bin = Resolve-ClaudeBin
-    if (-not $bin) { throw "fix CLAUDE_BIN in $ConfigFile before installing" }
+    $bin = Resolve-CodexBin
+    if (-not $bin) { throw "fix CODEX_BIN in $ConfigFile before installing" }
 
     $psExe = Get-PowerShellPath
     $argLine = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden ' +
@@ -640,12 +700,12 @@ function Invoke-CmdInstall {
         -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
 
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-        -Settings $settings -Description 'Keeps Claude Code''s 5-hour usage window rolling.' `
+        -Settings $settings -Description 'Keeps the Codex CLI''s 5-hour usage window rolling.' `
         -Force | Out-Null
 
     Write-Say "installed scheduled task '$TaskName' (hourly at :$('{0:d2}' -f [int]$Config.CRON_MINUTE))"
     Write-Say ''
-    Write-Say 'It checks every hour and only calls Claude when the window has actually'
+    Write-Say 'It checks every hour and only calls Codex when the window has actually'
     Write-Say 'expired, so a missed run (sleep, reboot) self-corrects.'
 
     $state = Get-KwState
@@ -699,23 +759,24 @@ function Invoke-CmdLog {
 }
 
 function Invoke-CmdConfig {
-    $bin = Resolve-ClaudeBin
+    $bin = Resolve-CodexBin
     Write-Say "keepwarm $KeepwarmVersion (windows / task scheduler)"
     Write-Say ''
     Write-Say ("{0,-24} {1}{2}" -f 'config file', $ConfigFile, $(if (Test-Path -LiteralPath $ConfigFile) { '' } else { ' (absent, using defaults)' }))
-    Write-Say ("{0,-24} {1}" -f 'claude bin', $(if ($bin) { $bin } else { 'NOT FOUND' }))
+    Write-Say ("{0,-24} {1}" -f 'codex bin', $(if ($bin) { $bin } else { 'NOT FOUND' }))
     Write-Say ("{0,-24} {1}" -f 'state', $StateFile)
     Write-Say ("{0,-24} {1}" -f 'log', $LogFile)
     Write-Say ''
     foreach ($k in 'WINDOW_HOURS','SLACK_MINUTES','MODEL','CRON_MINUTE','LOG_RETENTION_DAYS',
-                   'PING_ATTEMPTS','PING_RETRY_DELAY','SKIP_IF_RECENTLY_ACTIVE','ACTIVITY_DIR') {
+                   'PING_ATTEMPTS','PING_RETRY_DELAY','PING_TIMEOUT','IGNORE_USER_CONFIG',
+                   'SKIP_IF_RECENTLY_ACTIVE','ACTIVITY_DIR') {
         Write-Say ("{0,-24} {1}" -f $k, $Config[$k])
     }
 }
 
 function Show-Usage {
     Write-Say @"
-keepwarm $KeepwarmVersion - keep Claude Code's 5-hour usage window rolling
+keepwarm $KeepwarmVersion - keep the Codex CLI's 5-hour usage window rolling
 
   .\keepwarm.ps1 install          install the hourly scheduled task
   .\keepwarm.ps1 ping             open a window now; also re-phases boundaries
@@ -723,14 +784,14 @@ keepwarm $KeepwarmVersion - keep Claude Code's 5-hour usage window rolling
   .\keepwarm.ps1 status           current window, next ping, recent log
 
   .\keepwarm.ps1 run              ping only if the window expired (what the task calls)
-  .\keepwarm.ps1 ping --dry-run   print the exact command without calling Claude
+  .\keepwarm.ps1 ping --dry-run   print the exact command without calling Codex
   .\keepwarm.ps1 log [n]          last n log lines (default 40)
   .\keepwarm.ps1 config           resolved settings and paths
   .\keepwarm.ps1 uninstall        remove the task (add --purge to drop state too)
   .\keepwarm.ps1 version          print the version
 
 Configure by copying config.env.example to config.env next to this script.
-https://github.com/mamuncseru/claude-keepwarm
+https://github.com/alanrliu/codex-keepwarm
 "@
 }
 

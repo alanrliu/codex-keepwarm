@@ -1,8 +1,8 @@
-site_name: claude-keepwarm
-site_description: Keep Claude Code's 5-hour usage window rolling, so idle time burns windows instead of your working time.
-site_url: https://mamuncseru.github.io/claude-keepwarm/
-repo_url: https://github.com/mamuncseru/claude-keepwarm
-repo_name: mamuncseru/claude-keepwarm
+site_name: codex-keepwarm
+site_description: Keep the Codex CLI's 5-hour usage window rolling, so idle time burns windows instead of your working time.
+site_url: https://alanrliu.github.io/codex-keepwarm/
+repo_url: https://github.com/alanrliu/codex-keepwarm
+repo_name: alanrliu/codex-keepwarm
 edit_uri: ""
 
 theme:
@@ -73,7 +73,7 @@ nav:
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/mamuncseru/claude-keepwarm
-      name: claude-keepwarm on GitHub
+      link: https://github.com/alanrliu/codex-keepwarm
+      name: codex-keepwarm on GitHub
 
-copyright: MIT licensed. An unofficial community tool, not affiliated with Anthropic.
+copyright: MIT licensed. A port of claude-keepwarm. An unofficial community tool, not affiliated with OpenAI.

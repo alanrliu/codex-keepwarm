@@ -3,9 +3,12 @@
 # keepwarm test suite. No network, no API calls, no real crontab.
 #
 # Each test runs in a throwaway sandbox with a PATH shim providing a stub
-# `claude` (canned responses, counts invocations) and a fake `crontab`
+# `codex` (canned responses, counts invocations) and a fake `crontab`
 # (reads/writes a temp file). That makes install/uninstall safe to test and
 # keeps results independent of the developer's real environment.
+#
+# The stub speaks the same JSONL event stream `codex exec --json` does: a
+# turn is successful if and only if it ends with a turn.completed event.
 #
 #   ./tests/run.sh            run everything
 #   ./tests/run.sh floor      run tests whose name matches "floor"
@@ -36,24 +39,38 @@ setup() {
     FAKE_CRONTAB="$SANDBOX/crontab.txt"
     : >"$FAKE_CRONTAB"
 
-    cat >"$BIN/claude" <<'STUB'
+    cat >"$BIN/codex" <<'STUB'
 #!/usr/bin/env bash
 printf 'call\n' >>"${STUB_LOG:-/dev/null}"
+# codex exec announces this on every non-TTY run; the script has to strip it.
+printf 'Reading additional input from stdin...\n'
+printf '%s\n' '{"type":"thread.started","thread_id":"stub-thread"}'
 case "${STUB_MODE:-ok}" in
   limited)
-    printf 'Claude usage limit reached. Your limit will reset at 3pm.\n'; exit 0 ;;
+    printf "You've hit your usage limit. Try again later.\n"
+    printf '%s\n' '{"type":"turn.failed","error":{"message":"You'"'"'ve hit your usage limit."}}'
+    exit 1 ;;
   error)
-    printf '{"is_error":true,"result":"stub failure","total_cost_usd":0}\n'; exit 1 ;;
+    printf '%s\n' '{"type":"turn.failed","error":{"message":"stub failure"}}'
+    exit 1 ;;
   auth)
-    printf '%s\n' '{"is_error":true,"duration_api_ms":0,"stop_reason":"stop_sequence","total_cost_usd":0,"terminal_reason":"api_error","result":"Failed to authenticate: OAuth session expired and could not be refreshed","type":"result"}'; exit 1 ;;
+    printf '%s\n' '{"type":"error","message":"Reconnecting... 1/5 (unexpected status 401 Unauthorized: Missing bearer or basic authentication in header)"}'
+    printf '%s\n' '{"type":"turn.failed","error":{"message":"401 Unauthorized: Missing bearer or basic authentication in header"}}'
+    exit 1 ;;
+  hang)
+    sleep 60 ;;
   flaky)
     # fail the first attempt, succeed afterwards
     if [ "$(wc -l <"${STUB_LOG:-/dev/null}" | tr -d ' ')" -le 1 ]; then
-      printf '{"is_error":true,"result":"transient"}\n'; exit 1
+      printf '%s\n' '{"type":"turn.failed","error":{"message":"transient"}}'
+      exit 1
     fi
-    printf '{"is_error":false,"result":"ok","usage":{"input_tokens":167,"output_tokens":71}}\n'; exit 0 ;;
+    printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":13629,"output_tokens":5}}'
+    exit 0 ;;
   *)
-    printf '{"is_error":false,"result":"ok","total_cost_usd":0.000522,"usage":{"input_tokens":167,"output_tokens":71}}\n'; exit 0 ;;
+    printf '%s\n' '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Pong."}}'
+    printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":13629,"cached_input_tokens":11520,"output_tokens":5}}'
+    exit 0 ;;
 esac
 STUB
 
@@ -68,7 +85,7 @@ case "${1:-}" in
 esac
 FAKE
 
-    chmod +x "$BIN/claude" "$BIN/crontab"
+    chmod +x "$BIN/codex" "$BIN/crontab"
 
     export PATH="$BIN:$ORIG_PATH"
     export STUB_LOG FAKE_CRONTAB
@@ -77,6 +94,7 @@ FAKE
     export KEEPWARM_ACTIVITY_DIR="$SANDBOX/activity"
     export KEEPWARM_PING_ATTEMPTS=2
     export KEEPWARM_PING_RETRY_DELAY=0
+    export KEEPWARM_PING_TIMEOUT=5
 }
 
 teardown() {
@@ -149,7 +167,7 @@ test_ping_opens_window_on_the_hour() {
     local start end
     start="$(state_get WINDOW_START)"
     end="$(state_get WINDOW_END)"
-    assert_eq "1" "$(calls)" "claude called exactly once"
+    assert_eq "1" "$(calls)" "codex called exactly once"
     assert_eq "ok" "$(state_get LAST_STATUS)" "status recorded"
     assert_eq "0" "$(( start % 60 ))" "window start is on a minute boundary"
     assert_eq "00:00" "$(t_fmt "$start" '+%M:%S')" "window start floored to the top of the hour"
@@ -209,15 +227,15 @@ test_auth_failure_is_not_retried() {
     assert_eq "1" "$(calls)" "auth failure is NOT retried - it is not transient"
     assert_eq "auth" "$(state_get LAST_STATUS)" "records auth"
     assert_eq "$before" "$(state_get WINDOW_END)" "window NOT advanced on auth failure"
-    assert_match "$(logtext)" "AUTH +Failed to authenticate" "logs the readable cause, not just the blob"
+    assert_match "$(logtext)" "AUTH +401 Unauthorized" "logs the readable cause, not just the blob"
 }
 
 test_auth_failure_gives_actionable_advice() {
     local out
     out="$(STUB_MODE="auth" "$KW" ping 2>&1)"
     assert_match "$out" "not authenticated" "says what went wrong"
-    assert_match "$out" "OAuth session expired" "surfaces the CLI's own message"
-    assert_match "$out" "/login" "tells the user how to fix it"
+    assert_match "$out" "401 Unauthorized" "surfaces the CLI's own message"
+    assert_match "$out" "codex login" "tells the user how to fix it"
 }
 
 test_doctor_flags_expired_auth() {
@@ -242,8 +260,9 @@ test_skips_ping_when_user_was_active() {
     local start
     start="$(hours_ago_boundary 6)"
     write_state "$start"
-    # A transcript touched after the window boundary means the user's own
-    # messages already opened the new window.
+    # A rollout file touched after the window boundary means the user's own
+    # messages already opened the new window. keepwarm's own pings run with
+    # --ephemeral and write none, so they cannot trigger this.
     touch "$KEEPWARM_ACTIVITY_DIR/session.jsonl"
     "$KW" run >/dev/null 2>&1
     assert_eq "0" "$(calls)" "no ping spent when already active"
@@ -286,12 +305,12 @@ test_lock_released_after_run() {
 
 test_install_and_uninstall() {
     "$KW" install >/dev/null 2>&1
-    assert_match "$(cat "$FAKE_CRONTAB")" "claude-keepwarm" "cron line written"
+    assert_match "$(cat "$FAKE_CRONTAB")" "codex-keepwarm" "cron line written"
     assert_match "$(cat "$FAKE_CRONTAB")" "^2 \* \* \* \*" "fires hourly at :02"
     "$KW" install >/dev/null 2>&1     # idempotent
-    assert_eq "1" "$(grep -c 'claude-keepwarm' "$FAKE_CRONTAB")" "install is idempotent"
+    assert_eq "1" "$(grep -c 'codex-keepwarm' "$FAKE_CRONTAB")" "install is idempotent"
     "$KW" uninstall >/dev/null 2>&1
-    assert_eq "0" "$(grep -c 'claude-keepwarm' "$FAKE_CRONTAB")" "uninstall removes the line"
+    assert_eq "0" "$(grep -c 'codex-keepwarm' "$FAKE_CRONTAB")" "uninstall removes the line"
 }
 
 test_install_preserves_other_cron_entries() {
@@ -306,7 +325,7 @@ test_uninstall_keeps_state_by_default() {
     "$KW" install >/dev/null 2>&1
     "$KW" ping >/dev/null 2>&1
     "$KW" uninstall >/dev/null 2>&1
-    assert_eq "0" "$(grep -c 'claude-keepwarm' "$FAKE_CRONTAB")" "schedule removed"
+    assert_eq "0" "$(grep -c 'codex-keepwarm' "$FAKE_CRONTAB")" "schedule removed"
     if [ ! -f "$KEEPWARM_HOME/state/window.env" ]; then
         fail_test "state should survive a plain uninstall so reinstalling keeps the window"
     fi
@@ -316,7 +335,7 @@ test_uninstall_purge_removes_state_and_logs() {
     "$KW" install >/dev/null 2>&1
     "$KW" ping >/dev/null 2>&1
     "$KW" uninstall --purge >/dev/null 2>&1
-    assert_eq "0" "$(grep -c 'claude-keepwarm' "$FAKE_CRONTAB")" "schedule removed"
+    assert_eq "0" "$(grep -c 'codex-keepwarm' "$FAKE_CRONTAB")" "schedule removed"
     if [ -d "$KEEPWARM_HOME/state" ]; then fail_test "--purge should remove state/"; fi
     if [ -d "$KEEPWARM_HOME/logs" ];  then fail_test "--purge should remove logs/"; fi
 }
@@ -353,6 +372,42 @@ test_doctor_passes_when_healthy() {
     local out
     out="$("$KW" doctor 2>&1)"
     assert_match "$out" "0 failing" "doctor reports healthy"
+}
+
+# A de-authed codex retries its connection for ~30s before giving up, and a
+# wedged one would otherwise hold the lock until something killed it.
+test_hung_ping_is_killed_at_the_timeout() {
+    write_state "$(hours_ago_boundary 6)"
+    local before started elapsed
+    before="$(state_get WINDOW_END)"
+    started="$(date '+%s')"
+    STUB_MODE="hang" KEEPWARM_PING_TIMEOUT=2 KEEPWARM_PING_ATTEMPTS=1 \
+        "$KW" run >/dev/null 2>&1
+    elapsed=$(( $(date '+%s') - started ))
+    assert_eq "error" "$(state_get LAST_STATUS)" "records error"
+    assert_eq "$before" "$(state_get WINDOW_END)" "window NOT advanced on timeout"
+    assert_match "$(logtext)" "ERROR +timed out" "says it timed out"
+    if [ "$elapsed" -gt 20 ]; then
+        fail_test "timeout did not fire: run took ${elapsed}s"
+    fi
+}
+
+# The lock is only useful if a killed ping still releases it.
+test_lock_released_after_timeout() {
+    write_state "$(hours_ago_boundary 6)"
+    STUB_MODE="hang" KEEPWARM_PING_TIMEOUT=2 KEEPWARM_PING_ATTEMPTS=1 \
+        "$KW" run >/dev/null 2>&1
+    if [ -d "$KEEPWARM_HOME/state/keepwarm.lock.d" ]; then
+        fail_test "lock directory left behind after a timed-out ping"
+    fi
+}
+
+# Only a turn.completed event means the window opened. codex emits `error`
+# events it then recovers from, so their presence must not fail a good ping.
+test_recovered_error_events_still_count_as_success() {
+    write_state "$(hours_ago_boundary 6)"
+    "$KW" run >/dev/null 2>&1
+    assert_eq "ok" "$(state_get LAST_STATUS)" "turn.completed is the success signal"
 }
 
 test_config_and_version_do_not_touch_state() {
